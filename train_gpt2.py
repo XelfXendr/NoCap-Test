@@ -8,11 +8,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from torch import nn
-import torch.distributed as dist
 import torch.nn.functional as F
 import torch._inductor.config as config
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
 
 with open(sys.argv[0]) as f:
     code = f.read()
@@ -391,23 +388,13 @@ if __name__ == "__main__":
     # set up DDP (distributed data parallel). torchrun sets this env variable
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend="nccl")
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
-    ddp_world_size = int(os.environ["WORLD_SIZE"])
-    assert (
-        args.grad_accumulation_steps % ddp_world_size == 0
-    ), "grad_accumulation_steps must be divisible by world size"
-    args.grad_accumulation_steps //= (
-        ddp_world_size  # each gpu does its fraction of the work
-    )
-    device = f"cuda:{ddp_local_rank}"
+    
+    device = "cuda:0"
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
     seed_offset = 0  # each process gets the exact same seed
     print(f"using device: {device}")
 
-    if args.log_wandb and master_process:
+    if args.log_wandb:
         import wandb
         import datetime
 
@@ -417,21 +404,21 @@ if __name__ == "__main__":
         wandb.save("train_gpt2.py")
         wandb.save("run.sh")
 
-    tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
+    tokens_per_iter = B * T * args.grad_accumulation_steps
     print0(f"tokens per iteration: {tokens_per_iter:,}")
 
     # set up a context manager following the desired dtype and device
-    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) # type: ignore
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    train_loader = DistributedDataLoader(args.input_bin, B, T, 0, 1)
     val_loader = None
-    tokens_per_iter_val = args.val_batch_size * T * ddp_world_size
+    tokens_per_iter_val = args.val_batch_size * T
     assert VAL_TOKENS % tokens_per_iter_val == 0
     val_steps = VAL_TOKENS // tokens_per_iter_val
 
     val_loader = DistributedDataLoader(
-        args.input_val_bin, args.val_batch_size, T, ddp_rank, ddp_world_size
+        args.input_val_bin, args.val_batch_size, T, 0, 1
     )
     x, y = train_loader.next_batch()
 
@@ -449,17 +436,14 @@ if __name__ == "__main__":
     model = model.train().cuda()
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True  # suggested by @Chillee
+    """
     print0("compiling the model...")
     model = torch.compile(
         model
     )  # NOTE: this might cause issues depending on your GPU, consider turning it off
-
-    # here we wrap model into DDP container
-    model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module  # always contains the "raw" unwrapped model
-
+    """
     # init the optimizer
-    optimizer = raw_model.configure_optimizers(
+    optimizer = model.configure_optimizers(
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
         betas=(0.9, 0.95),
@@ -484,7 +468,7 @@ if __name__ == "__main__":
 
     # create the logging directory if it does not exist
     logfile = None
-    if master_process and args.output_dir:
+    if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
         logfile = os.path.join(args.output_dir, "%s.log" % run_id)
         # create the log file "main.log" inside it, and wipe it clean
@@ -513,17 +497,15 @@ if __name__ == "__main__":
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
-                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= val_steps
             # log to console and to file
             print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}")
-            if master_process:
-                if args.log_wandb:
-                    wandb.log({"val_loss": val_loss}, step=step * tokens_per_iter)
-                    wandb.log({"time": training_time_ms}, step=step * tokens_per_iter)
-                if logfile is not None:
-                    with open(logfile, "a") as f:
-                        f.write("s:%d val:%f\n" % (step, val_loss))
+            if args.log_wandb:
+                wandb.log({"val_loss": val_loss}, step=step * tokens_per_iter) # type: ignore
+                wandb.log({"time": training_time_ms}, step=step * tokens_per_iter) # type: ignore
+            if logfile is not None:
+                with open(logfile, "a") as f:
+                    f.write("s:%d val:%f\n" % (step, val_loss))
 
             # restart the clock
             torch.cuda.synchronize()
@@ -540,9 +522,6 @@ if __name__ == "__main__":
         model.train()
         train_loss = torch.zeros(1, device=device)
         for micro_step in range(args.grad_accumulation_steps):
-            model.require_backward_grad_sync = (
-                micro_step == args.grad_accumulation_steps - 1
-            )  # sync only on last micro step to avoid overhead
             # forward pass
             with ctx:
                 _, loss = model(x, y, return_logits=False)
@@ -574,18 +553,17 @@ if __name__ == "__main__":
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
         # the 0th iteration is often an outlier (much slower) => skip logging it
         # tokens_per_second = ddp_world_size * B * T / (t1-t0)
-        dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item()  # keep track of the mean loss
         print0(
             f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | train_time:{approx_training_time_ms/1000:.2f}s | step_avg:{approx_training_time_ms/(step+1):.2f}ms"
         )
         # log to logile
-        if master_process and logfile is not None:
+        if logfile is not None:
             with open(logfile, "a") as f:
                 f.write("s:%d trn:%f\n" % (step, lossf))
 
-        if master_process and (step + 1) % args.save_every == 0:
-            log = dict(model=raw_model.state_dict(), code=code, args=args.__dict__)
+        if (step + 1) % args.save_every == 0:
+            log = dict(model=model.state_dict(), code=code, args=args.__dict__)
             os.makedirs("logs/%s" % run_id, exist_ok=True)
             torch.save(log, "logs/%s/model_step%06d.pt" % (run_id, step))
 
@@ -595,11 +573,8 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
 
-    if master_process:
-        log = dict(model=raw_model.state_dict(), code=code, args=args.__dict__)
-        os.makedirs("logs/%s" % run_id, exist_ok=True)
-        torch.save(log, "logs/%s/final.pt" % run_id)
+    log = dict(model=model.state_dict(), code=code, args=args.__dict__)
+    os.makedirs("logs/%s" % run_id, exist_ok=True)
+    torch.save(log, "logs/%s/final.pt" % run_id)
 
     # -------------------------------------------------------------------------
-    # clean up nice
-    destroy_process_group()
