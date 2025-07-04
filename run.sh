@@ -1,3 +1,5 @@
+WANDB_KEY=$(cat wandb_key)
+
 uv run train_gpt2.py \
   --input_bin "data/fineweb10B/fineweb_train_*.bin" \
   --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
@@ -14,4 +16,5 @@ uv run train_gpt2.py \
   --warmup_iters 256 \
   --warmdown_iters 1024 \
   --log_wandb \
+  --wandb_key $WANDB_KEY \
   --device "cpu"
