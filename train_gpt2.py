@@ -31,11 +31,11 @@ class Rotary(torch.nn.Module):
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
             self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq) # type: ignore
+            freqs = torch.outer(t, self.inv_freq).to(x.device) # type: ignore
             self.cos_cached = freqs.cos()
             self.sin_cached = freqs.sin()
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :] # type: ignore
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -145,7 +145,7 @@ class GPT(nn.Module):
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = (
+        self.transformer.wte.weight = ( # type: ignore
             self.lm_head.weight
         )  # https://paperswithcode.com/method/weight-tying
 
@@ -154,9 +154,9 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)  # shape (t)
 
         # forward the GPT model itself
-        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        x = self.transformer.wte(idx)  # type: ignore # token embeddings of shape (b, t, n_embd)
 
-        for block in self.transformer.h:
+        for block in self.transformer.h: # type: ignore
             x = block(x)
         x = rmsnorm(x)
 
@@ -224,11 +224,12 @@ def _load_data_shard(filename):
 
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes, device):
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.B = B
         self.T = T
+        self.device = device
 
         # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
@@ -271,7 +272,7 @@ class DistributedDataLoader:
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
-        return x.cuda(), y.cuda()
+        return x.to(device), y.to(device)
 
 
 # -----------------------------------------------------------------------------
@@ -291,7 +292,7 @@ if __name__ == "__main__":
     import time
     import argparse
 
-    print0(f"Running pytorch {torch.version.__version__}")
+    print0(f"Running pytorch {torch.version.__version__}") # type: ignore
 
     parser = argparse.ArgumentParser()
     # file system input / output
@@ -380,6 +381,19 @@ if __name__ == "__main__":
         action="store_true",
         help="log to wandb",
     )
+    parser.add_argument(
+        "--wandb_key",
+        type=str,
+        default="",
+        help="wandb key to use for logging",
+    )
+
+    parser.add_argument(
+        "--device", 
+        type=str,
+        default="cuda",
+        help="device to use for training, e.g. cuda, cuda:0 or cpu",
+    )
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -389,14 +403,16 @@ if __name__ == "__main__":
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
     
-    device = "cuda:0"
-    torch.cuda.set_device(device)
+    device = torch.device(args.device)
+    #torch.cuda.set_device(device)
     seed_offset = 0  # each process gets the exact same seed
     print(f"using device: {device}")
 
     if args.log_wandb:
         import wandb
         import datetime
+
+        wandb.login(key=args.wandb_key)
 
         start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         wandb.init(project="benchmark_gpt2", name=f"gpt2-{args.model} {start_time}")
@@ -411,14 +427,14 @@ if __name__ == "__main__":
     ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) # type: ignore
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, B, T, 0, 1)
+    train_loader = DistributedDataLoader(args.input_bin, B, T, 0, 1, device)
     val_loader = None
     tokens_per_iter_val = args.val_batch_size * T
     assert VAL_TOKENS % tokens_per_iter_val == 0
     val_steps = VAL_TOKENS // tokens_per_iter_val
 
     val_loader = DistributedDataLoader(
-        args.input_val_bin, args.val_batch_size, T, 0, 1
+        args.input_val_bin, args.val_batch_size, T, 0, 1, device
     )
     x, y = train_loader.next_batch()
 
@@ -432,8 +448,8 @@ if __name__ == "__main__":
         "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280),
         "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
     }[args.model]
-    model = GPT(model_config)
-    model = model.train().cuda()
+    model = GPT(model_config).to(device)
+    model = model.train()
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True  # suggested by @Chillee
     """
