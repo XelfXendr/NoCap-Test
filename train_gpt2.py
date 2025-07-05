@@ -473,7 +473,7 @@ if __name__ == "__main__":
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
 
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    #torch.cuda.set_device(device)
     seed_offset = 0  # each process gets the exact same seed
     print(f"using device: {device}")
 
