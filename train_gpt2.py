@@ -78,6 +78,8 @@ class LoRALinear(nn.Module):
             param.requires_grad = False
         for param in self.a_proj.parameters():
             param.requires_grad = True
+        for param in self.b_proj.parameters():
+            param.requires_grad = True
 
     def forward(self, x):
         # Combine with the original projection
