@@ -6,3 +6,6 @@ wandb/
 .venv/
 uv.lock
 wandb_key
+
+*.e*
+*.o*
