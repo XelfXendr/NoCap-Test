@@ -31,11 +31,11 @@ class Rotary(torch.nn.Module):
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
             self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)  # type: ignore
-            freqs = torch.outer(t, self.inv_freq).to(x.device)  # type: ignore
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq) # type: ignore
+            freqs = torch.outer(t, self.inv_freq).to(x.device) # type: ignore
             self.cos_cached = freqs.cos()
             self.sin_cached = freqs.sin()
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]  # type: ignore
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :] # type: ignore
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -54,45 +54,8 @@ def rmsnorm(x0, eps=1e-6):
     return x.type_as(x0)
 
 
-class LoRALinear(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        rank: int = 4,
-        alpha: float = 4,
-        bias: bool = True,
-    ):
-        super().__init__()
-        self.w_proj = nn.Linear(in_features, out_features, bias=bias)
-        self.a_proj = nn.Linear(in_features, rank, bias=False)
-        self.b_proj = nn.Linear(rank, out_features, bias=False)
-        self.scale = alpha / rank
-
-        # init LoRA weights
-        torch.nn.init.xavier_normal_(self.a_proj.weight)
-        torch.nn.init.zeros_(self.b_proj.weight)
-
-        # lock w_proj but leave a_proj and b_proj trainable
-        for param in self.w_proj.parameters():
-            param.requires_grad = False
-        for param in self.a_proj.parameters():
-            param.requires_grad = True
-
-    def forward(self, x):
-        # Combine with the original projection
-        return self.w_proj(x) + self.b_proj(self.a_proj(x)) * self.scale
-
-    # merge LoRAs into the backbone projection and re-initialize LoRA projections for a zero output
-    def merge(self):
-        self.w_proj.weight.data += (
-            self.b_proj.weight @ self.a_proj.weight
-        ) * self.scale
-        torch.nn.init.xavier_normal_(self.a_proj.weight)
-        torch.nn.init.zeros_(self.b_proj.weight)
-
-
 class CausalSelfAttention(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.n_head = config.n_head
@@ -100,9 +63,9 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = LoRALinear(self.n_embd, 3 * self.n_embd, bias=False, rank=config.lora_rank, alpha=config.lora_alpha)
+        self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
         # output projection
-        self.c_proj = LoRALinear(self.n_embd, self.n_embd, bias=False, rank=config.lora_rank, alpha=config.lora_alpha)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x):
@@ -127,30 +90,24 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.c_proj(y)
         return y
-    
-    def merge_loras(self):
-        self.c_attn.merge()
-        self.c_proj.merge()
 
 
 class MLP(nn.Module):
+
     def __init__(self, config):
         super().__init__()
-        self.c_fc = LoRALinear(config.n_embd, 4 * config.n_embd, bias=False, rank=config.lora_rank, alpha=config.lora_alpha)
-        self.c_proj = LoRALinear(4 * config.n_embd, config.n_embd, bias=False, rank=config.lora_rank, alpha=config.lora_alpha)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
         x = F.gelu(x)
         x = self.c_proj(x)
         return x
-    
-    def merge_loras(self):
-        self.c_fc.merge()
-        self.c_proj.merge()
 
 
 class Block(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
@@ -161,10 +118,6 @@ class Block(nn.Module):
         x = x + self.attn_scale * self.attn(rmsnorm(x))
         x = x + self.mlp(rmsnorm(x))
         return x
-    
-    def merge_loras(self):
-        self.attn.merge_loras()
-        self.mlp.merge_loras()
 
 
 # -----------------------------------------------------------------------------
@@ -177,11 +130,10 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    lora_rank: int = 4
-    lora_alpha: float = 4.0
 
 
 class GPT(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -193,7 +145,7 @@ class GPT(nn.Module):
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = (  # type: ignore
+        self.transformer.wte.weight = ( # type: ignore
             self.lm_head.weight
         )  # https://paperswithcode.com/method/weight-tying
 
@@ -204,7 +156,7 @@ class GPT(nn.Module):
         # forward the GPT model itself
         x = self.transformer.wte(idx)  # type: ignore # token embeddings of shape (b, t, n_embd)
 
-        for block in self.transformer.h:  # type: ignore
+        for block in self.transformer.h: # type: ignore
             x = block(x)
         x = rmsnorm(x)
 
@@ -232,10 +184,6 @@ class GPT(nn.Module):
             self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas
         )
         return optimizer
-    
-    def merge_loras(self):
-        for block in self.transformer.h: # type: ignore
-            block.merge_loras()
 
 
 # -----------------------------------------------------------------------------
@@ -285,9 +233,9 @@ class DistributedDataLoader:
 
         # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, (
-            f"did not find any files that match the pattern {filename_pattern}"
-        )
+        assert (
+            len(self.files) > 0
+        ), f"did not find any files that match the pattern {filename_pattern}"
 
         # load and validate all data shards, count number of tokens in total
         ntok_total = np.int64(0)
@@ -344,7 +292,7 @@ if __name__ == "__main__":
     import time
     import argparse
 
-    print0(f"Running pytorch {torch.version.__version__}")  # type: ignore
+    print0(f"Running pytorch {torch.version.__version__}") # type: ignore
 
     parser = argparse.ArgumentParser()
     # file system input / output
@@ -439,29 +387,12 @@ if __name__ == "__main__":
         default="",
         help="wandb key to use for logging",
     )
+
     parser.add_argument(
-        "--device",
+        "--device", 
         type=str,
         default="cuda",
         help="device to use for training, e.g. cuda, cuda:0 or cpu",
-    )
-    parser.add_argument(
-        "--lora_rank",
-        type=int,
-        default=8,
-        help="rank of LoRA projections",
-    )
-    parser.add_argument(
-        "--lora_alpha",
-        type=float,
-        default=8.0,
-        help="alpha scaling factor for LoRA projections",
-    )
-    parser.add_argument(
-        "--merge_every",
-        type=int,
-        default=100,
-        help="merge LoRA projections into the backbone every n optimizer steps",
     )
     args = parser.parse_args()
 
@@ -471,9 +402,9 @@ if __name__ == "__main__":
     # set up DDP (distributed data parallel). torchrun sets this env variable
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-
+    
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    #torch.cuda.set_device(device)
     seed_offset = 0  # each process gets the exact same seed
     print(f"using device: {device}")
 
@@ -493,7 +424,7 @@ if __name__ == "__main__":
     print0(f"tokens per iteration: {tokens_per_iter:,}")
 
     # set up a context manager following the desired dtype and device
-    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)  # type: ignore
+    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) # type: ignore
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, 0, 1, device)
@@ -511,37 +442,11 @@ if __name__ == "__main__":
     num_vocab = 50257
     model_config = {
         "d12": GPTConfig(
-            vocab_size=num_vocab,
-            n_layer=12,
-            n_head=12,
-            n_embd=768,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
+            vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768
         ),  # 124M GPT-2
-        "d24": GPTConfig(
-            vocab_size=num_vocab,
-            n_layer=24,
-            n_head=16,
-            n_embd=1024,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-        ),
-        "d36": GPTConfig(
-            vocab_size=num_vocab,
-            n_layer=36,
-            n_head=20,
-            n_embd=1280,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-        ),
-        "d48": GPTConfig(
-            vocab_size=num_vocab,
-            n_layer=48,
-            n_head=25,
-            n_embd=1600,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-        ),
+        "d24": GPTConfig(vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024),
+        "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280),
+        "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
     }[args.model]
     model = GPT(model_config).to(device)
     model = model.train()
@@ -612,8 +517,8 @@ if __name__ == "__main__":
             # log to console and to file
             print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}")
             if args.log_wandb:
-                wandb.log({"val_loss": val_loss}, step=step * tokens_per_iter)  # type: ignore
-                wandb.log({"time": training_time_ms}, step=step * tokens_per_iter)  # type: ignore
+                wandb.log({"val_loss": val_loss}, step=step * tokens_per_iter) # type: ignore
+                wandb.log({"time": training_time_ms}, step=step * tokens_per_iter) # type: ignore
             if logfile is not None:
                 with open(logfile, "a") as f:
                     f.write("s:%d val:%f\n" % (step, val_loss))
@@ -656,11 +561,6 @@ if __name__ == "__main__":
         # step the optimizer
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-
-        # merge LoRA projections into the backbone
-        if (args.merge_every > 0 and (step + 1)  % args.merge_every == 0) or last_step:
-            model.merge_loras()
-
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
 
@@ -671,7 +571,7 @@ if __name__ == "__main__":
         # tokens_per_second = ddp_world_size * B * T / (t1-t0)
         lossf = train_loss.item()  # keep track of the mean loss
         print0(
-            f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | train_time:{approx_training_time_ms / 1000:.2f}s | step_avg:{approx_training_time_ms / (step + 1):.2f}ms"
+            f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | train_time:{approx_training_time_ms/1000:.2f}s | step_avg:{approx_training_time_ms/(step+1):.2f}ms"
         )
         # log to logile
         if logfile is not None:

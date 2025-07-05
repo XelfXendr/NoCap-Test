@@ -2,7 +2,7 @@
 #PBS -q gpu@pbs-m1.metacentrum.cz
 #PBS -l select=1:ncpus=4:ngpus=1:mem=16gb:gpu_mem=16gb:scratch_local=64gb:cluster=galdor
 #PBS -l walltime=24:00:00
-#PBS -N nocap_baseline
+#PBS -N lora_merge
 
 # storage is shared via NFSv4
 HOMEDIR="/storage/brno2/home/$LOGNAME"
@@ -27,7 +27,7 @@ cd $SCRATCHDIR/NoCap-Test
 $UV sync --cache-dir "$SCRATCHDIR/uv_cache" --index-strategy unsafe-best-match
 
 # ... the computation ...
-$UV run train_gpt2_baseline.py \
+$UV run train_gpt2.py \
   --input_bin "data/fineweb10B/fineweb_train_*.bin" \
   --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
   --model d12 \
@@ -42,4 +42,7 @@ $UV run train_gpt2_baseline.py \
   --warmup_iters 256 \
   --warmdown_iters 1024 \
   --log_wandb \
-  --wandb_key $WANDB_KEY
+  --wandb_key $WANDB_KEY \
+  --lora_rank 8 \
+  --lora_alpha 8.0 \
+  --merge_every 100
