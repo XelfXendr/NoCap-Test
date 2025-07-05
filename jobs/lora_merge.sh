@@ -24,7 +24,7 @@ cp -r $DATADIR $SCRATCHDIR
 cd $SCRATCHDIR/NoCap-Test
 
 # set up python environment
-$UV sync --cache-dir "$SCRATCHDIR/uv_cache"
+$UV sync --cache-dir "$SCRATCHDIR/uv_cache" --index-strategy unsafe-best-match
 
 # ... the computation ...
 $UV run train_gpt2.py \
